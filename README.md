@@ -5,11 +5,13 @@ A web search, page reading, and browser automation skill for [OpenClaw](https://
 ## Features
 
 - **Web Search** — Multi-engine (DuckDuckGo, Brave, Google) with pagination
-- **Page Reader** — Extract clean, structured text from any URL with JS rendering
-- **Persistent Browser** — Visible browser session with navigate, click, and screenshot
+- **Page Reader** — Extract clean text from any URL with JS rendering
+- **Persistent Browser** — Visible browser with tabs, click, screenshot, and text search
+- **Cookie Auto-Dismiss** — Automatically clears cookie consent banners
 - **File Download** — Download files with auto-detection, PDF text extraction
+- **Output Formats** — JSON, markdown, or plain text
 - **Zero API Keys** — Everything runs locally
-- **JSON Output** — All scripts output structured JSON
+- **JSON Output** — All scripts output structured JSON by default
 
 ## Requirements
 
@@ -21,8 +23,6 @@ A web search, page reading, and browser automation skill for [OpenClaw](https://
 ## Installation
 
 ### As an OpenClaw Skill
-
-Copy into your OpenClaw skills directory:
 
 ```bash
 cp -r web-scraper/ $(dirname $(which openclaw))/../lib/node_modules/openclaw/skills/web-scraper
@@ -50,55 +50,64 @@ python3 scripts/google_search.py "search term" --pages 3 --engine brave
 | `--pages N` | Result pages (~10 results each) | 1 |
 | `--engine` | `duckduckgo`, `brave`, or `google` | duckduckgo |
 
-**Output:** `[{title, url, snippet}, ...]`
-
 **Engine notes:**
-- **duckduckgo** — Most reliable, no CAPTCHA issues
-- **brave** — Good alternative with offset-based pagination
-- **google** — Often blocked by CAPTCHA; use as last resort
+- **duckduckgo** — Most reliable, no CAPTCHA
+- **brave** — More results per page, broader sources
+- **google** — Often blocked by CAPTCHA; last resort
 
 ### 2. Read a Page
 
 ```bash
-python3 scripts/read_page.py "https://example.com" --max-chars 10000 --visible
+python3 scripts/read_page.py "https://example.com" --max-chars 10000 --format markdown
 ```
 
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--max-chars N` | Max characters to extract | 50000 |
 | `--visible` | Show browser window | off |
-
-**Output:** `{title, content}`
+| `--format` | `json`, `markdown`, or `text` | json |
+| `--no-dismiss` | Skip cookie consent auto-dismiss | off |
 
 ### 3. Persistent Browser Session
 
 ```bash
-# Open a page (visible browser stays open)
+# Open a page (auto-dismisses cookies, extracts content)
 python3 scripts/browser_session.py open "https://example.com"
 
-# Navigate to a different URL
+# Navigate
 python3 scripts/browser_session.py navigate "https://other-site.com"
 
-# Re-extract content from current page
-python3 scripts/browser_session.py extract
+# Extract content in different formats
+python3 scripts/browser_session.py extract --format markdown
+python3 scripts/browser_session.py extract --format text
 
-# Take a screenshot
+# Screenshot
 python3 scripts/browser_session.py screenshot /tmp/page.png
 python3 scripts/browser_session.py screenshot /tmp/full.png --full
 
-# Click an element (by text, CSS selector, or button/link name)
+# Click elements
 python3 scripts/browser_session.py click "Sign In"
 python3 scripts/browser_session.py click "#submit-btn"
-python3 scripts/browser_session.py click "a.nav-link"
 
-# Close the browser
+# Search for text in the page
+python3 scripts/browser_session.py search "pricing"
+
+# Tab management
+python3 scripts/browser_session.py tab new "https://docs.example.com"
+python3 scripts/browser_session.py tab list
+python3 scripts/browser_session.py tab switch 0
+python3 scripts/browser_session.py tab close 1
+
+# Manually dismiss cookie banner
+python3 scripts/browser_session.py dismiss-cookies
+
+# Close
 python3 scripts/browser_session.py close
 ```
 
-Click resolution order:
-1. CSS selector match
-2. Visible text match (partial)
-3. Button or link role match by name
+**Click resolution:** CSS selector → visible text → button/link role name
+
+**Tab management:** Each tab is independent. `tab new` opens and switches to the new tab. `tab switch` brings a tab to focus. `tab close` closes by index (defaults to active tab).
 
 ### 4. Download Files
 
@@ -111,21 +120,15 @@ python3 scripts/download_file.py "https://example.com/report.pdf" --output ~/doc
 | `--output DIR` | Save directory | /tmp/downloads |
 | `--filename` | Override filename | auto-detected |
 
-**Output:** `{status, path, filename, size_bytes, content_type}`
-
-For PDFs, also returns `extracted_text` if `pdfplumber` or `PyPDF2` is installed.
-
-**Filename detection order:**
-1. `Content-Disposition` header
-2. URL path
-3. `Content-Type` header fallback
+For PDFs, returns `extracted_text` if `pdfplumber` or `PyPDF2` is installed.
 
 ## How It Works
 
-- **Search** uses HTTP requests to DuckDuckGo/Brave/Google HTML endpoints via `requests` + `BeautifulSoup`
-- **Page reading** uses Playwright + Chromium with a read-only DOM TreeWalker (no DOM mutation)
-- **Browser sessions** use a Unix socket server — a forked child keeps the browser alive while commands return immediately
-- **Downloads** stream files to disk with automatic filename detection and optional PDF text extraction
+- **Search** — HTTP requests to DuckDuckGo/Brave/Google HTML endpoints
+- **Page reading** — Playwright + Chromium with read-only DOM TreeWalker (no mutation)
+- **Cookie dismiss** — Tries common selectors and button text patterns (Accept All, Got It, etc.)
+- **Browser sessions** — Unix socket server; forked child keeps browser alive, commands return immediately
+- **Downloads** — Streams to disk with auto filename detection from headers/URL
 
 ---
 
@@ -134,49 +137,55 @@ For PDFs, also returns `extracted_text` if `pdfplumber` or `PyPDF2` is installed
 ### When to Use This Skill
 
 - Search the web for current information
-- Read/extract content from a specific URL
-- Browse a page visually and interact (click, navigate)
+- Read/extract content from a URL
+- Browse interactively (click, navigate, tabs)
 - Take screenshots for visual context
-- Download and read PDF documents or other files
+- Search for specific text within a page
+- Download PDFs or other files
+- Deal with cookie-walled content
 
 ### Quick Reference
 
 ```bash
-# Search (pick an engine)
+# Search
 python3 scripts/google_search.py "query" --pages N --engine duckduckgo|brave|google
 
-# Read page (headless, fast)
-python3 scripts/read_page.py "https://url" --max-chars N
+# Read (headless, fast)
+python3 scripts/read_page.py "url" --max-chars N --format json|markdown|text
 
 # Interactive browser
-python3 scripts/browser_session.py open "https://url"
-python3 scripts/browser_session.py click "Button Text"
-python3 scripts/browser_session.py screenshot /tmp/shot.png
-python3 scripts/browser_session.py navigate "https://other"
-python3 scripts/browser_session.py extract
+python3 scripts/browser_session.py open "url"
+python3 scripts/browser_session.py click "Button"
+python3 scripts/browser_session.py search "keyword"
+python3 scripts/browser_session.py screenshot /path/to/file.png
+python3 scripts/browser_session.py tab new "url2"
+python3 scripts/browser_session.py tab list
+python3 scripts/browser_session.py tab switch 0
+python3 scripts/browser_session.py extract --format markdown
 python3 scripts/browser_session.py close
 
-# Download files
-python3 scripts/download_file.py "https://url/file.pdf" --output /tmp/downloads
+# Download
+python3 scripts/download_file.py "url" --output /tmp/downloads
 ```
 
 ### Workflow Pattern
 
-1. **Search** → get list of URLs
-2. **Read** or **Open** → extract content from relevant URLs
-3. **Click/Navigate** → interact if needed (login, pagination, etc.)
-4. **Screenshot** → capture visual state
-5. **Download** → grab linked files (PDFs, CSVs, etc.)
-6. **Close** → clean up browser session
+1. **Search** → get URLs
+2. **Read** or **Open** → extract content
+3. **Click/Navigate/Tab** → interact as needed
+4. **Search** → find specific info in page
+5. **Screenshot** → capture visual state
+6. **Download** → grab linked files
+7. **Close** → clean up
 
 ### Important Notes
 
-- All output is **JSON to stdout**
-- `browser_session.py` is **stateful** — one session at a time
+- All output defaults to **JSON to stdout**; use `--format` for alternatives
+- `browser_session.py` is **stateful** with multi-tab support — one session at a time
 - `read_page.py` is **stateless** — opens/closes browser each call
+- Cookie consent is **auto-dismissed** on open/navigate
 - Always **close** browser sessions when done
-- DuckDuckGo is the most reliable engine; use `brave` as backup
-- Scripts are in the `scripts/` directory relative to the skill root
+- Scripts are in `scripts/` relative to the skill root
 
 ## License
 

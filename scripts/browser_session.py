@@ -2,18 +2,24 @@
 """Persistent browser session that stays open until told to close.
 
 Usage:
-    python3 browser_session.py open <url>                    Open URL in visible browser, extract content
-    python3 browser_session.py navigate <url>                Go to new URL, extract content
-    python3 browser_session.py extract                       Re-extract content from current page
-    python3 browser_session.py screenshot [path]             Save screenshot (default: /tmp/screenshot.png)
-    python3 browser_session.py click <selector_or_text>      Click an element by CSS selector or text
-    python3 browser_session.py close                         Close the browser
+    python3 browser_session.py open <url>                       Open URL in visible browser, extract content
+    python3 browser_session.py navigate <url>                   Go to new URL, extract content
+    python3 browser_session.py extract [--format FMT]           Re-extract content from current page
+    python3 browser_session.py screenshot [path] [--full]       Save screenshot
+    python3 browser_session.py click <selector_or_text>         Click an element
+    python3 browser_session.py search <text>                    Search for text in page content
+    python3 browser_session.py tab new <url>                    Open URL in new tab
+    python3 browser_session.py tab list                         List all open tabs
+    python3 browser_session.py tab switch <index>               Switch to tab by index
+    python3 browser_session.py tab close [index]                Close tab (current if no index)
+    python3 browser_session.py close                            Close browser
 
-The browser runs as a persistent process. Commands are sent via a socket.
+Formats for extract: json (default), markdown, text
 """
 
 import json
 import os
+import re
 import signal
 import socket
 import sys
@@ -56,6 +62,89 @@ EXTRACT_JS = """() => {
     return { title, content };
 }"""
 
+# Common cookie consent selectors and text patterns
+COOKIE_DISMISS_JS = """() => {
+    const selectors = [
+        'button[id*="accept" i]', 'button[id*="consent" i]', 'button[id*="agree" i]',
+        'button[class*="accept" i]', 'button[class*="consent" i]', 'button[class*="agree" i]',
+        'a[id*="accept" i]', 'a[class*="accept" i]',
+        '[data-testid*="accept" i]', '[data-testid*="consent" i]',
+        '.cookie-banner button', '.cookie-notice button', '.cookie-popup button',
+        '#cookie-banner button', '#cookie-notice button', '#cookie-popup button',
+        '.cc-btn.cc-dismiss', '.cc-accept', '#onetrust-accept-btn-handler',
+        '.js-cookie-consent-agree', '[aria-label*="accept" i][aria-label*="cookie" i]',
+        '[aria-label*="Accept all" i]', '[aria-label*="Accept cookies" i]',
+    ];
+
+    // Try selectors first
+    for (const sel of selectors) {
+        try {
+            const el = document.querySelector(sel);
+            if (el && el.offsetParent !== null) { el.click(); return { dismissed: true, method: 'selector', selector: sel }; }
+        } catch(e) {}
+    }
+
+    // Try matching button text
+    const patterns = [
+        /^accept all$/i, /accept all cookies/i, /accept cookies/i, /accept & close/i,
+        /^agree$/i, /agree and continue/i, /agree & continue/i,
+        /consent and continue/i, /consent & continue/i,
+        /got it/i, /i understand/i, /i agree/i,
+        /allow all/i, /allow cookies/i, /allow all cookies/i,
+        /^ok$/i, /^okay$/i, /^continue$/i, /^dismiss$/i,
+        /accept and close/i, /accept and continue/i,
+        /nur notwendige/i, /alle akzeptieren/i, /akzeptieren/i,
+        /tout accepter/i, /accepter/i, /accepter et continuer/i,
+    ];
+    for (const btn of document.querySelectorAll('button, a[role="button"], [role="button"]')) {
+        const text = btn.innerText?.trim();
+        if (!text || text.length > 50) continue;
+        for (const pat of patterns) {
+            if (pat.test(text) && btn.offsetParent !== null) {
+                btn.click();
+                return { dismissed: true, method: 'text', matched: text };
+            }
+        }
+    }
+
+    return { dismissed: false };
+}"""
+
+
+def format_output(result: dict, fmt: str) -> str:
+    """Format extraction result based on requested format."""
+    if fmt == "text":
+        # Strip markdown-ish formatting
+        content = result.get("content", "")
+        content = re.sub(r'^#+\s+', '', content, flags=re.MULTILINE)
+        content = re.sub(r'^- ', '  ', content, flags=re.MULTILINE)
+        content = re.sub(r'^> ', '', content, flags=re.MULTILINE)
+        return content.strip()
+    elif fmt == "markdown":
+        return f"# {result.get('title', '')}\n\n{result.get('content', '')}"
+    else:  # json
+        return json.dumps(result, indent=2, ensure_ascii=False)
+
+
+def dismiss_cookies(page):
+    """Try to dismiss cookie consent in main frame and all iframes."""
+    result = page.evaluate(COOKIE_DISMISS_JS)
+    if result.get("dismissed"):
+        page.wait_for_timeout(500)
+        return result
+    # Check iframes (many EU sites put consent in an iframe)
+    for frame in page.frames:
+        if frame == page.main_frame:
+            continue
+        try:
+            result = frame.evaluate(COOKIE_DISMISS_JS)
+            if result.get("dismissed"):
+                page.wait_for_timeout(500)
+                return result
+        except Exception:
+            pass
+    return {"dismissed": False}
+
 
 def run_server(url: str):
     from playwright.sync_api import sync_playwright
@@ -70,11 +159,21 @@ def run_server(url: str):
         locale="en-US",
         viewport={"width": 1280, "height": 900},
     )
-    page = ctx.new_page()
-    page.goto(url, timeout=30000, wait_until="domcontentloaded")
-    page.wait_for_timeout(1500)
 
-    result = page.evaluate(EXTRACT_JS)
+    # Track pages (tabs)
+    pages = [ctx.new_page()]
+    active_idx = 0
+
+    def active_page():
+        return pages[active_idx]
+
+    active_page().goto(url, timeout=30000, wait_until="domcontentloaded")
+    active_page().wait_for_timeout(1500)
+
+    # Auto-dismiss cookie consent on first load (main frame + iframes)
+    dismiss_cookies(active_page())
+
+    result = active_page().evaluate(EXTRACT_JS)
     with open("/tmp/web-scraper-initial.json", "w") as f:
         json.dump(result, f, ensure_ascii=False)
 
@@ -90,7 +189,7 @@ def run_server(url: str):
     while running:
         try:
             conn, _ = sock.accept()
-            data = conn.recv(4096).decode()
+            data = conn.recv(8192).decode()
             cmd = json.loads(data)
             action = cmd.get("action")
 
@@ -100,9 +199,10 @@ def run_server(url: str):
                 running = False
 
             elif action == "navigate":
-                page.goto(cmd["url"], timeout=30000, wait_until="domcontentloaded")
-                page.wait_for_timeout(1500)
-                result = page.evaluate(EXTRACT_JS)
+                active_page().goto(cmd["url"], timeout=30000, wait_until="domcontentloaded")
+                active_page().wait_for_timeout(1500)
+                dismiss_cookies(active_page())
+                result = active_page().evaluate(EXTRACT_JS)
                 mc = cmd.get("max_chars")
                 if mc and len(result["content"]) > mc:
                     result["content"] = result["content"][:mc] + "\n\n[...truncated]"
@@ -110,56 +210,137 @@ def run_server(url: str):
                 conn.close()
 
             elif action == "extract":
-                result = page.evaluate(EXTRACT_JS)
+                result = active_page().evaluate(EXTRACT_JS)
                 mc = cmd.get("max_chars")
                 if mc and len(result["content"]) > mc:
                     result["content"] = result["content"][:mc] + "\n\n[...truncated]"
-                conn.sendall(json.dumps(result, ensure_ascii=False).encode())
+                fmt = cmd.get("format", "json")
+                output = format_output(result, fmt) if fmt != "json" else json.dumps(result, ensure_ascii=False)
+                conn.sendall(output.encode())
                 conn.close()
 
             elif action == "screenshot":
                 path = cmd.get("path", "/tmp/screenshot.png")
                 full_page = cmd.get("full_page", False)
-                page.screenshot(path=path, full_page=full_page)
+                active_page().screenshot(path=path, full_page=full_page)
                 conn.sendall(json.dumps({
-                    "status": "saved",
-                    "path": path,
-                    "url": page.url,
-                    "title": page.title(),
+                    "status": "saved", "path": path,
+                    "url": active_page().url, "title": active_page().title(),
+                    "tab": active_idx,
                 }).encode())
                 conn.close()
 
             elif action == "click":
                 target = cmd.get("target", "")
                 clicked = False
-                # Try CSS selector first
                 try:
-                    el = page.query_selector(target)
+                    el = active_page().query_selector(target)
                     if el:
                         el.click()
                         clicked = True
                 except Exception:
                     pass
-                # Fall back to text-based click
                 if not clicked:
                     try:
-                        page.get_by_text(target, exact=False).first.click()
+                        active_page().get_by_text(target, exact=False).first.click()
                         clicked = True
                     except Exception:
                         pass
-                # Fall back to role-based (button/link)
                 if not clicked:
                     try:
-                        page.get_by_role("button", name=target).or_(
-                            page.get_by_role("link", name=target)
+                        active_page().get_by_role("button", name=target).or_(
+                            active_page().get_by_role("link", name=target)
                         ).first.click()
                         clicked = True
                     except Exception:
                         pass
-
-                page.wait_for_timeout(1000)
-                result = {"status": "clicked" if clicked else "not_found", "target": target, "url": page.url}
+                active_page().wait_for_timeout(1000)
+                result = {"status": "clicked" if clicked else "not_found", "target": target, "url": active_page().url}
                 conn.sendall(json.dumps(result, ensure_ascii=False).encode())
+                conn.close()
+
+            elif action == "dismiss_cookies":
+                result = dismiss_cookies(active_page())
+                conn.sendall(json.dumps(result, ensure_ascii=False).encode())
+                conn.close()
+
+            elif action == "search":
+                query = cmd.get("query", "").lower()
+                result = active_page().evaluate(EXTRACT_JS)
+                content = result.get("content", "")
+                lines = content.split("\n")
+                matches = []
+                for i, line in enumerate(lines):
+                    if query in line.lower():
+                        matches.append({"line": i + 1, "text": line.strip()})
+                conn.sendall(json.dumps({
+                    "query": query,
+                    "matches": len(matches),
+                    "results": matches[:50],  # cap at 50
+                    "url": active_page().url,
+                }, ensure_ascii=False).encode())
+                conn.close()
+
+            elif action == "tab_new":
+                new_page = ctx.new_page()
+                pages.append(new_page)
+                active_idx = len(pages) - 1
+                new_page.goto(cmd["url"], timeout=30000, wait_until="domcontentloaded")
+                new_page.wait_for_timeout(1500)
+                dismiss_cookies(new_page)
+                result = new_page.evaluate(EXTRACT_JS)
+                result["tab"] = active_idx
+                result["total_tabs"] = len(pages)
+                conn.sendall(json.dumps(result, ensure_ascii=False).encode())
+                conn.close()
+
+            elif action == "tab_list":
+                tab_info = []
+                for i, p in enumerate(pages):
+                    try:
+                        tab_info.append({
+                            "index": i,
+                            "title": p.title(),
+                            "url": p.url,
+                            "active": i == active_idx,
+                        })
+                    except Exception:
+                        tab_info.append({"index": i, "title": "(closed)", "url": "", "active": i == active_idx})
+                conn.sendall(json.dumps({"tabs": tab_info, "active": active_idx}, ensure_ascii=False).encode())
+                conn.close()
+
+            elif action == "tab_switch":
+                idx = cmd.get("index", 0)
+                if 0 <= idx < len(pages):
+                    active_idx = idx
+                    pages[active_idx].bring_to_front()
+                    conn.sendall(json.dumps({
+                        "status": "switched", "tab": active_idx,
+                        "title": pages[active_idx].title(),
+                        "url": pages[active_idx].url,
+                    }, ensure_ascii=False).encode())
+                else:
+                    conn.sendall(json.dumps({"error": f"Invalid tab index {idx}. Have {len(pages)} tabs."}).encode())
+                conn.close()
+
+            elif action == "tab_close":
+                idx = cmd.get("index", active_idx)
+                if len(pages) <= 1:
+                    conn.sendall(json.dumps({"error": "Cannot close the last tab. Use 'close' to close the browser."}).encode())
+                elif 0 <= idx < len(pages):
+                    pages[idx].close()
+                    pages.pop(idx)
+                    if active_idx >= len(pages):
+                        active_idx = len(pages) - 1
+                    elif active_idx > idx:
+                        active_idx -= 1
+                    pages[active_idx].bring_to_front()
+                    conn.sendall(json.dumps({
+                        "status": "tab_closed", "closed_index": idx,
+                        "active": active_idx, "total_tabs": len(pages),
+                    }, ensure_ascii=False).encode())
+                else:
+                    conn.sendall(json.dumps({"error": f"Invalid tab index {idx}"}).encode())
                 conn.close()
 
             else:
@@ -183,7 +364,7 @@ def run_server(url: str):
     pw.stop()
 
 
-def send_command(cmd: dict) -> dict:
+def send_command(cmd: dict) -> str:
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.connect(SOCKET_PATH)
     sock.sendall(json.dumps(cmd).encode())
@@ -194,12 +375,12 @@ def send_command(cmd: dict) -> dict:
             break
         chunks.append(chunk)
     sock.close()
-    return json.loads(b"".join(chunks))
+    return b"".join(chunks).decode()
 
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: browser_session.py <open|navigate|extract|screenshot|click|close> [args]")
+        print("Usage: browser_session.py <open|navigate|extract|screenshot|click|search|tab|close> [args]")
         sys.exit(1)
 
     action = sys.argv[1]
@@ -229,7 +410,7 @@ def main():
                         result = json.load(f)
                     os.remove("/tmp/web-scraper-initial.json")
                     result["status"] = "browser open"
-                    result["note"] = "Commands: navigate <url>, extract, screenshot [path], click <target>, close"
+                    result["note"] = "Commands: navigate, extract, screenshot, click, search, tab, close"
                     print(json.dumps(result, indent=2, ensure_ascii=False))
                     sys.exit(0)
                 time.sleep(0.5)
@@ -240,30 +421,71 @@ def main():
         if len(sys.argv) < 3:
             print("Usage: browser_session.py navigate <url>")
             sys.exit(1)
-        result = send_command({"action": "navigate", "url": sys.argv[2], "max_chars": 50000})
-        print(json.dumps(result, indent=2, ensure_ascii=False))
+        print(send_command({"action": "navigate", "url": sys.argv[2], "max_chars": 50000}))
 
     elif action == "extract":
-        result = send_command({"action": "extract", "max_chars": 50000})
-        print(json.dumps(result, indent=2, ensure_ascii=False))
+        fmt = "json"
+        if "--format" in sys.argv:
+            idx = sys.argv.index("--format")
+            if idx + 1 < len(sys.argv):
+                fmt = sys.argv[idx + 1]
+        print(send_command({"action": "extract", "max_chars": 50000, "format": fmt}))
 
     elif action == "screenshot":
-        path = sys.argv[2] if len(sys.argv) > 2 else "/tmp/screenshot.png"
+        path = "/tmp/screenshot.png"
         full_page = "--full" in sys.argv
-        result = send_command({"action": "screenshot", "path": path, "full_page": full_page})
-        print(json.dumps(result, indent=2, ensure_ascii=False))
+        for arg in sys.argv[2:]:
+            if not arg.startswith("--"):
+                path = arg
+                break
+        print(send_command({"action": "screenshot", "path": path, "full_page": full_page}))
 
     elif action == "click":
         if len(sys.argv) < 3:
             print("Usage: browser_session.py click <selector_or_text>")
             sys.exit(1)
-        target = " ".join(sys.argv[2:])
-        result = send_command({"action": "click", "target": target})
-        print(json.dumps(result, indent=2, ensure_ascii=False))
+        target = " ".join(a for a in sys.argv[2:] if not a.startswith("--"))
+        print(send_command({"action": "click", "target": target}))
+
+    elif action == "search":
+        if len(sys.argv) < 3:
+            print("Usage: browser_session.py search <text>")
+            sys.exit(1)
+        query = " ".join(sys.argv[2:])
+        print(send_command({"action": "search", "query": query}))
+
+    elif action == "tab":
+        if len(sys.argv) < 3:
+            print("Usage: browser_session.py tab <new|list|switch|close> [args]")
+            sys.exit(1)
+        sub = sys.argv[2]
+        if sub == "new":
+            if len(sys.argv) < 4:
+                print("Usage: browser_session.py tab new <url>")
+                sys.exit(1)
+            print(send_command({"action": "tab_new", "url": sys.argv[3]}))
+        elif sub == "list":
+            print(send_command({"action": "tab_list"}))
+        elif sub == "switch":
+            if len(sys.argv) < 4:
+                print("Usage: browser_session.py tab switch <index>")
+                sys.exit(1)
+            print(send_command({"action": "tab_switch", "index": int(sys.argv[3])}))
+        elif sub == "close":
+            idx = int(sys.argv[3]) if len(sys.argv) > 3 else -1
+            cmd = {"action": "tab_close"}
+            if idx >= 0:
+                cmd["index"] = idx
+            print(send_command(cmd))
+        else:
+            print(f"Unknown tab command: {sub}")
+            sys.exit(1)
+
+    elif action == "dismiss-cookies":
+        print(send_command({"action": "dismiss_cookies"}))
 
     elif action == "close":
-        result = send_command({"action": "close"})
-        print(json.dumps(result, indent=2, ensure_ascii=False))
+        print(send_command({"action": "close"}))
 
     else:
         print(f"Unknown action: {action}")

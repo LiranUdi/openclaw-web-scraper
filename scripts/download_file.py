@@ -22,6 +22,11 @@ import urllib.parse
 
 import requests
 
+
+def json_error(message: str) -> str:
+    """Return standardized JSON error format."""
+    return json.dumps({"error": message}, indent=2, ensure_ascii=False)
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 }
@@ -98,10 +103,20 @@ def extract_pdf_text(filepath: str) -> str:
     return ""
 
 
-def download(url: str, output_dir: str = "/tmp/downloads", filename: str = None) -> dict:
+def download(url: str, output_dir: str = "/tmp/downloads", filename: str = None, 
+            proxy: str = None, user_agent: str = None) -> dict:
     os.makedirs(output_dir, exist_ok=True)
 
-    resp = requests.get(url, headers=HEADERS, timeout=30, stream=True, allow_redirects=True)
+    headers = HEADERS.copy()
+    if user_agent:
+        headers["User-Agent"] = user_agent
+
+    proxies = {}
+    if proxy:
+        proxies = {"http": proxy, "https": proxy}
+
+    resp = requests.get(url, headers=headers, timeout=30, stream=True, 
+                       allow_redirects=True, proxies=proxies)
     resp.raise_for_status()
 
     if not filename:
@@ -132,6 +147,10 @@ def download(url: str, output_dir: str = "/tmp/downloads", filename: str = None)
         "content_type": content_type,
         "url": url,
     }
+    
+    # Add redirect URL if redirected
+    if resp.url != url:
+        result["redirect_url"] = resp.url
 
     # Extract text from PDFs
     if "pdf" in content_type.lower() or filepath.lower().endswith(".pdf"):
@@ -151,10 +170,15 @@ def main():
     parser.add_argument("url", help="URL to download")
     parser.add_argument("--output", default="/tmp/downloads", help="Output directory (default: /tmp/downloads)")
     parser.add_argument("--filename", default=None, help="Override filename")
+    parser.add_argument("--proxy", help="Proxy URL (e.g., http://proxy:8080)")
+    parser.add_argument("--user-agent", help="Override User-Agent string")
     args = parser.parse_args()
 
-    result = download(args.url, args.output, args.filename)
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+    try:
+        result = download(args.url, args.output, args.filename, args.proxy, args.user_agent)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    except Exception as e:
+        print(json_error(f"Download failed: {str(e)}"))
 
 
 if __name__ == "__main__":

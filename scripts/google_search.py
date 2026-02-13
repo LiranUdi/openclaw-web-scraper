@@ -20,6 +20,11 @@ import urllib.parse
 import requests
 from bs4 import BeautifulSoup
 
+
+def json_error(message: str) -> str:
+    """Return standardized JSON error format."""
+    return json.dumps({"error": message}, indent=2, ensure_ascii=False)
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept-Language": "en-US,en;q=0.9",
@@ -156,18 +161,21 @@ def main():
                         default="duckduckgo", help="Search engine (default: duckduckgo)")
     args = parser.parse_args()
 
-    search_fn = ENGINES[args.engine]
-    results = search_fn(args.query, args.pages)
+    try:
+        search_fn = ENGINES[args.engine]
+        results = search_fn(args.query, args.pages)
 
-    # Deduplicate
-    seen = set()
-    deduped = []
-    for r in results:
-        if r["url"] not in seen:
-            seen.add(r["url"])
-            deduped.append(r)
+        # Deduplicate
+        seen = set()
+        deduped = []
+        for r in results:
+            if r["url"] not in seen:
+                seen.add(r["url"])
+                deduped.append(r)
 
-    print(json.dumps(deduped, indent=2, ensure_ascii=False))
+        print(json.dumps(deduped, indent=2, ensure_ascii=False))
+    except Exception as e:
+        print(json_error(f"Search failed: {str(e)}"))
 
 
 if __name__ == "__main__":

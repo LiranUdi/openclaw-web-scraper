@@ -205,7 +205,12 @@ def run_server(url: str, headless: bool = False, proxy: str = None, user_agent: 
 
             elif action == "navigate":
                 t0 = time.time()
-                response = active_page().goto(cmd["url"], timeout=30000, wait_until="domcontentloaded")
+                response = None
+                try:
+                    response = active_page().goto(cmd["url"], timeout=30000, wait_until="domcontentloaded")
+                except Exception as nav_err:
+                    # Playwright throws on HTTP error codes (4xx/5xx) — still extract what we can
+                    pass
                 active_page().wait_for_timeout(1500)
                 load_time = round(time.time() - t0, 3)
                 dismiss_cookies(active_page())

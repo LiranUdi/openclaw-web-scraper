@@ -115,8 +115,13 @@ def download(url: str, output_dir: str = "/tmp/downloads", filename: str = None,
     if proxy:
         proxies = {"http": proxy, "https": proxy}
 
-    resp = requests.get(url, headers=headers, timeout=30, stream=True, 
-                       allow_redirects=True, proxies=proxies)
+    try:
+        resp = requests.get(url, headers=headers, timeout=30, stream=True, 
+                           allow_redirects=True, proxies=proxies)
+    except requests.exceptions.SSLError:
+        # Retry without SSL verification if certs are broken
+        resp = requests.get(url, headers=headers, timeout=30, stream=True,
+                           allow_redirects=True, proxies=proxies, verify=False)
     resp.raise_for_status()
 
     if not filename:

@@ -16,14 +16,8 @@ Outputs content in the requested format.
 import argparse
 import json
 import re
-import time
 
 from playwright.sync_api import sync_playwright
-
-
-def json_error(message: str) -> str:
-    """Return standardized JSON error format."""
-    return json.dumps({"error": message}, indent=2, ensure_ascii=False)
 
 EXTRACT_JS = """() => {
     const SKIP = new Set(['SCRIPT','STYLE','NOSCRIPT','IFRAME','SVG','NAV','FOOTER','HEADER','ASIDE']);
@@ -35,7 +29,6 @@ EXTRACT_JS = """() => {
         || document.body;
 
     const lines = [];
-    const seenText = new Set(); // Track already-output text to prevent duplication
     const walker = document.createTreeWalker(mainEl, NodeFilter.SHOW_ELEMENT, {
         acceptNode(node) {
             if (SKIP.has(node.tagName)) return NodeFilter.FILTER_REJECT;
@@ -48,20 +41,12 @@ EXTRACT_JS = """() => {
     let node;
     while (node = walker.nextNode()) {
         const text = node.innerText?.trim();
-        if (!text || seenText.has(text)) continue;
-        
-        // Only process if this element has no accepted children with text
-        const hasAcceptedChildren = Array.from(node.querySelectorAll('h1,h2,h3,h4,h5,h6,p,li,td,th,pre,blockquote'))
-            .some(child => child.innerText?.trim() && !seenText.has(child.innerText.trim()));
-        
-        if (!hasAcceptedChildren) {
-            seenText.add(text);
-            const tag = node.tagName.toLowerCase();
-            if (tag.startsWith('h')) lines.push('\\n' + '#'.repeat(parseInt(tag[1])) + ' ' + text + '\\n');
-            else if (tag === 'li') lines.push('- ' + text);
-            else if (tag === 'blockquote') lines.push('> ' + text);
-            else lines.push(text);
-        }
+        if (!text) continue;
+        const tag = node.tagName.toLowerCase();
+        if (tag.startsWith('h')) lines.push('\\n' + '#'.repeat(parseInt(tag[1])) + ' ' + text + '\\n');
+        else if (tag === 'li') lines.push('- ' + text);
+        else if (tag === 'blockquote') lines.push('> ' + text);
+        else lines.push(text);
     }
     let content = lines.join('\\n').trim();
     if (content.length < 200) content = mainEl.innerText || '';
@@ -128,62 +113,40 @@ def main():
     parser.add_argument("--visible", action="store_true", help="Run in visible (non-headless) mode")
     parser.add_argument("--format", choices=["json", "markdown", "text"], default="json", help="Output format")
     parser.add_argument("--no-dismiss", action="store_true", help="Skip cookie consent auto-dismiss")
-    parser.add_argument("--timeout", type=int, default=30, help="Page navigation timeout in seconds (default: 30)")
-    parser.add_argument("--wait", type=int, default=1500, help="Post-navigation wait in ms (default: 1500)")
-    parser.add_argument("--proxy", help="Proxy URL (e.g., http://proxy:8080)")
-    parser.add_argument("--user-agent", help="Override User-Agent string")
     args = parser.parse_args()
 
-    try:
-        with sync_playwright() as p:
-            launch_options = {"headless": not args.visible}
-            if args.proxy:
-                launch_options["proxy"] = {"server": args.proxy}
-            
-            browser = p.chromium.launch(**launch_options)
-            
-            context_options = {
-                "user_agent": args.user_agent or "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "locale": "en-US",
-                "viewport": {"width": 1280, "height": 900},
-            }
-            
-            ctx = browser.new_context(**context_options)
-            page = ctx.new_page()
-            
-            start_time = time.time()
-            page.goto(args.url, timeout=args.timeout * 1000, wait_until="domcontentloaded")
-            page.wait_for_timeout(args.wait)
-            load_time_ms = int((time.time() - start_time) * 1000)
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=not args.visible)
+        ctx = browser.new_context(
+            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            locale="en-US",
+            viewport={"width": 1280, "height": 900},
+        )
+        page = ctx.new_page()
+        page.goto(args.url, timeout=30000, wait_until="domcontentloaded")
+        page.wait_for_timeout(1500)
 
-            if not args.no_dismiss:
-                # Try main frame first, then iframes (EU sites often use iframe consent)
-                dismissed = page.evaluate(COOKIE_DISMISS_JS)
-                if not dismissed.get("dismissed"):
-                    for frame in page.frames:
-                        if frame == page.main_frame:
-                            continue
-                        try:
-                            r = frame.evaluate(COOKIE_DISMISS_JS)
-                            if r.get("dismissed"):
-                                break
-                        except Exception:
-                            pass
-                page.wait_for_timeout(500)
+        if not args.no_dismiss:
+            # Try main frame first, then iframes (EU sites often use iframe consent)
+            dismissed = page.evaluate(COOKIE_DISMISS_JS)
+            if not dismissed.get("dismissed"):
+                for frame in page.frames:
+                    if frame == page.main_frame:
+                        continue
+                    try:
+                        r = frame.evaluate(COOKIE_DISMISS_JS)
+                        if r.get("dismissed"):
+                            break
+                    except Exception:
+                        pass
+            page.wait_for_timeout(500)
 
-            result = page.evaluate(EXTRACT_JS)
-            if len(result["content"]) > args.max_chars:
-                result["content"] = result["content"][:args.max_chars] + "\n\n[...truncated]"
+        result = page.evaluate(EXTRACT_JS)
+        if len(result["content"]) > args.max_chars:
+            result["content"] = result["content"][:args.max_chars] + "\n\n[...truncated]"
 
-            # Add metadata
-            result["url"] = page.url  # Final URL after redirects
-            result["load_time_ms"] = load_time_ms
-
-            print(format_output(result, args.format))
-            browser.close()
-            
-    except Exception as e:
-        print(json_error(f"Error reading page: {str(e)}"))
+        print(format_output(result, args.format))
+        browser.close()
 
 
 if __name__ == "__main__":
